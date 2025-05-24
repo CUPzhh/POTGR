@@ -170,25 +170,53 @@ class DiffGR(TrainerX):
                 loss = F.cross_entropy(output, label)
                 self.model_backward_and_update(loss)
         else:
-            pseudo_images, pseudo_label = generate_images_and_labels(self.classnames_encountered[:self.num_classes_base], self.B, device=self.device)
-            pseudo_feat = self.model.image_encoder(pseudo_images.type(self.model.dtype))
-            pseudo_feat = pseudo_feat / pseudo_feat.norm(dim=-1, keepdim=True)
+            # 生成伪图像与标签
+            pseudo_images, pseudo_label = generate_images_and_labels(
+                self.classnames_encountered[:self.num_classes_base], self.B, device=self.device
+            )
+
+            # 提取伪图像的特征作为prompt条件
+            pseudo_features = self.model.image_encoder(pseudo_images.type(self.model.dtype))
+            pseudo_features = pseudo_features / pseudo_features.norm(dim=-1, keepdim=True)
+
+            self.model.prompt_learner.set_condition(pseudo_features)
+
+            image_features = self.model.image_encoder(image.type(self.model.dtype))
+            image_features = image_features / image_features.norm(dim=-1, keepdim=True)
+
+            prompts = self.model.prompt_learner(image_features)
+            tokenized_prompts = self.model.tokenized_prompts
+            logit_scale = self.model.logit_scale.exp()
+
+            logits_real = []
+            for pts_i, imf_i in zip(prompts, image_features):
+                text_features = self.model.text_encoder(pts_i, tokenized_prompts)
+                text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+                l_i = logit_scale * imf_i @ text_features.t()
+                logits_real.append(l_i)
+            output = torch.stack(logits_real)
+
+            prompts_pseudo = self.model.prompt_learner(pseudo_features)
+            logits_pseudo = []
+            for pts_i, imf_i in zip(prompts_pseudo, pseudo_features):
+                text_features = self.model.text_encoder(pts_i, tokenized_prompts)
+                text_features = text_features / text_features.norm(dim=-1, keepdim=True)
+                l_i = logit_scale * imf_i @ text_features.t()
+                logits_pseudo.append(l_i)
+            output_pseudo = torch.stack(logits_pseudo)
+
+            label = label.to(self.device)
             pseudo_label = pseudo_label.to(self.device)
 
-            output, output_pseudo = self.model(image, pseudo_feat)
             loss = F.cross_entropy(torch.cat((output, output_pseudo)), torch.cat((label, pseudo_label)), reduction='none')
 
-            weight_n = torch.ones((image.shape[0]))
-            weight_o = torch.ones((pseudo_feat.shape[0]))
+            weight_n = torch.ones((output.shape[0]), device=self.device) * self.lambda_o
+            weight_o = torch.ones((output_pseudo.shape[0]), device=self.device) * (1 - self.lambda_o)
+            weight = torch.cat((weight_n, weight_o))
 
-            #  loss = weight_n * lambda_o + weight_o * (1 - lambda_o)
-            weight_n = weight_n * self.lambda_o
-            weight_o = weight_o * (1 - self.lambda_o)
-            weight = torch.cat((weight_n, weight_o)).half()
-
-            loss = loss * (weight.to(loss.device).detach())
-            loss = loss.mean()
+            loss = (loss * weight).mean()
             self.model_backward_and_update(loss)
+
 
         return {
             "loss": loss.item(),
